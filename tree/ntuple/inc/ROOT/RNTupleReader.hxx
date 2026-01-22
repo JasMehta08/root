@@ -464,6 +464,7 @@ public:
    /// ~~~
    void EnableMetrics() { fMetrics.Enable(); }
    const Experimental::Detail::RNTupleMetrics &GetMetrics() const { return fMetrics; }
+   Experimental::Detail::RNTupleMetrics &GetMetrics() { return fMetrics; }
 }; // class RNTupleReader
 
 } // namespace ROOT
