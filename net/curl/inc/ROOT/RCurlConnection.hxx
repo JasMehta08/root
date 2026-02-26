@@ -45,6 +45,14 @@ public:
       explicit operator bool() const { return fStatusCode == kSuccess; }
    };
 
+   /// S3 credential material for AWS SigV4 authentication.
+   /// All fields use the ROOT naming convention (fXxx prefix).
+   struct RS3Credentials {
+      std::string fAccessKey; ///< AWS_ACCESS_KEY_ID
+      std::string fSecretKey; ///< AWS_SECRET_ACCESS_KEY
+      std::string fRegion;    ///< e.g. "us-east-1"; optional, libcurl can extract from hostname
+   };
+
 private:
    void *fHandle = nullptr; ///< the CURL easy handle corresponding to this connection
    /// If set to zero, automatically adjust: try with all given ranges and as long as the number of ranges is too large,
@@ -53,11 +61,14 @@ private:
    std::size_t fMaxNRangesPerReqest = 0;
    std::string fEscapedUrl;              ///< The URL provided in the constructor escaped according to standard rules
    std::unique_ptr<char[]> fErrorBuffer; ///< For use by libcurl
+   std::unique_ptr<RS3Credentials> fS3Credentials; ///< S3 credentials; nullptr means no authentication
 
    void SetupErrorBuffer();
    void SetOptions();
    RResult<void> SetUrl(const std::string &url);
    void Perform(RStatus &status);
+   /// Conditionally set AWS SigV4 curl options before a request if S3 credentials are present.
+   void ApplyS3Auth();
 
 public:
    /// Returned by SendHeadReq() if the HTTP response contains no content-length header
@@ -89,6 +100,16 @@ public:
    /// a valid batching of requests into multiple multi-range requests takes place automatically.
    /// The fNBytesRecv member of the ranges is only well-defined on success.
    RStatus SendRangesReq(std::size_t N, RUserRange *ranges);
+
+   /// Pass S3 credentials for authenticated requests.
+   /// If set, SendHeadReq() and SendRangesReq() will add AWS SigV4 authentication headers.
+   void SetS3Credentials(const RS3Credentials &creds);
+
+   /// Clear S3 credentials, reverting to unauthenticated requests.
+   void ClearS3Credentials();
+
+   /// Return true if S3 credentials are currently set.
+   bool HasS3Credentials() const;
 
    const std::string &GetEscapedUrl() const { return fEscapedUrl; }
 

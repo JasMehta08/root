@@ -599,6 +599,7 @@ ROOT::Internal::RCurlConnection::~RCurlConnection()
 ROOT::Internal::RCurlConnection::RCurlConnection(RCurlConnection &&other)
 {
    std::swap(fHandle, other.fHandle);
+   fS3Credentials = std::move(other.fS3Credentials);
    SetupErrorBuffer();
 }
 
@@ -606,8 +607,11 @@ ROOT::Internal::RCurlConnection &ROOT::Internal::RCurlConnection::RCurlConnectio
 {
    if (this == &other)
       return *this;
+   if (fHandle)
+      curl_easy_cleanup(fHandle);
    fHandle = other.fHandle;
    other.fHandle = nullptr;
+   fS3Credentials = std::move(other.fS3Credentials);
    SetupErrorBuffer();
    return *this;
 }
@@ -643,6 +647,41 @@ void ROOT::Internal::RCurlConnection::SetOptions()
 
    rc = curl_easy_setopt(fHandle, CURLOPT_WRITEFUNCTION, CallbackData);
    R__ASSERT(rc == CURLE_OK);
+}
+
+void ROOT::Internal::RCurlConnection::SetS3Credentials(const RS3Credentials &creds)
+{
+   fS3Credentials = std::make_unique<RS3Credentials>(creds);
+}
+
+void ROOT::Internal::RCurlConnection::ClearS3Credentials()
+{
+   fS3Credentials.reset();
+}
+
+bool ROOT::Internal::RCurlConnection::HasS3Credentials() const
+{
+   return fS3Credentials != nullptr;
+}
+
+void ROOT::Internal::RCurlConnection::ApplyS3Auth()
+{
+   if (!fS3Credentials) {
+      curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, nullptr);
+      curl_easy_setopt(fHandle, CURLOPT_USERPWD, nullptr);
+      return;
+   }
+
+   // Build the SigV4 provider string: "aws:amz:REGION:s3"
+   std::string sigv4 = "aws:amz";
+   if (!fS3Credentials->fRegion.empty())
+      sigv4 += ":" + fS3Credentials->fRegion + ":s3";
+
+   curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, sigv4.c_str());
+
+   // Set credentials as access_key:secret_key
+   std::string userpwd = fS3Credentials->fAccessKey + ":" + fS3Credentials->fSecretKey;
+   curl_easy_setopt(fHandle, CURLOPT_USERPWD, userpwd.c_str());
 }
 
 ROOT::RResult<void> ROOT::Internal::RCurlConnection::SetUrl(const std::string &url)
@@ -714,6 +753,8 @@ ROOT::Internal::RCurlConnection::RStatus ROOT::Internal::RCurlConnection::SendHe
 {
    remoteSize = kUnknownSize;
 
+   ApplyS3Auth();
+
    auto rc = curl_easy_setopt(fHandle, CURLOPT_NOBODY, 1);
    R__ASSERT(rc == CURLE_OK);
    rc = curl_easy_setopt(fHandle, CURLOPT_RANGE, NULL); // may have been set by a previous SendRangesReq() on the object
@@ -760,6 +801,8 @@ ROOT::Internal::RCurlConnection::SendRangesReq(std::size_t N, RUserRange *ranges
       // In this case, we know that we did not apply any displacements
       return RStatus(RStatus::kSuccess);
    }
+
+   ApplyS3Auth();
 
    auto rc = curl_easy_setopt(fHandle, CURLOPT_HTTPGET, 1);
    R__ASSERT(rc == CURLE_OK);
