@@ -13,13 +13,16 @@
 #include <cassert>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <curl/curl.h>
@@ -40,8 +43,42 @@ static constexpr int kHttpResponseBadRequest = 400;
 static constexpr int kHttpResponseForbidden = 403;
 static constexpr int kHttpResponseNotFound = 404;
 static constexpr int kHttpResponseRangeNotSatisfiable = 416;
+static constexpr int kHttpResponseTooManyRequests = 429;
+static constexpr int kHttpResponseServerErrorClass = 5;
 
 static constexpr int kMaxDebugDataChars = 50; ///< Maximum number of characters of debug HTTP content before snipping
+
+static constexpr unsigned int kMaxBackoffMs = 30000; ///< Ceiling for a single backoff delay
+
+/// Delay in milliseconds before retry number `attempt` (one-based).
+///
+/// A server that sent Retry-After has told us how long to wait, so that wins. Otherwise the delay
+/// doubles per attempt from `baseMs`, with up to 25% of random jitter added: without jitter, a job
+/// reading many objects hits the same throttle and all its retries collide again in lockstep.
+unsigned int ComputeBackoffMs(unsigned int attempt, unsigned int baseMs, long retryAfterSec)
+{
+   R__ASSERT(attempt >= 1);
+
+   // The intermediate values are computed in 64 bits and only then capped: a server is free to send a
+   // Retry-After of millions of seconds, and a caller is free to set a large base delay, either of which
+   // overflows a 32-bit millisecond count before the cap can apply.
+   if (retryAfterSec > 0) {
+      const auto requested = static_cast<std::uint64_t>(retryAfterSec) * 1000;
+      return static_cast<unsigned int>(std::min<std::uint64_t>(requested, kMaxBackoffMs));
+   }
+   if (baseMs == 0)
+      return 0;
+
+   const unsigned int shift = std::min(attempt - 1, 15u);
+   const auto scaled = static_cast<std::uint64_t>(baseMs) << shift;
+   const auto delay = static_cast<unsigned int>(std::min<std::uint64_t>(scaled, kMaxBackoffMs));
+
+   static thread_local std::minstd_rand rng(
+      static_cast<std::minstd_rand::result_type>(std::chrono::steady_clock::now().time_since_epoch().count()));
+   std::uniform_int_distribution<unsigned int> jitter(0, delay / 4);
+   // Cap again: the jitter is added on top of an already capped delay.
+   return std::min(delay + jitter(rng), kMaxBackoffMs);
+}
 
 /// A byte range as specified in an HTTP range request header
 struct RHttpRange {
@@ -598,6 +635,32 @@ int CallbackPutSeek(void *userdata, curl_off_t offset, int origin)
    return CURL_SEEKFUNC_OK;
 }
 
+/// Read the Retry-After response header as a number of seconds, or -1 if it is absent, unparseable or
+/// given in the HTTP-date form (S3 and Ceph always use the delay-seconds form).
+///
+/// On libcurl older than 7.83 there is no header API, and adding a header callback to every request type
+/// just to read one optional header is not worth it: the caller then falls back to plain exponential
+/// backoff, which is a fine approximation of what the server asked for.
+long GetRetryAfterSeconds([[maybe_unused]] void *handle)
+{
+#ifdef HAS_CURL_EASY_HEADER
+   curl_header *header = nullptr;
+   if (curl_easy_header(handle, "Retry-After", 0, CURLH_HEADER, -1, &header) != CURLHE_OK)
+      return -1;
+   if (!header || !header->value)
+      return -1;
+
+   char *end = nullptr;
+   errno = 0;
+   const long seconds = std::strtol(header->value, &end, 10);
+   if ((end == header->value) || (errno == ERANGE) || (seconds <= 0))
+      return -1;
+   return seconds;
+#else
+   return -1;
+#endif
+}
+
 /// Wrapper around curl_easy_setopt that asserts on failure.  Most option-setting calls in this
 /// file use valid options and values by construction, so failure indicates a programming error.
 template <typename T>
@@ -668,6 +731,8 @@ ROOT::Internal::RCurlConnection::RCurlConnection(RCurlConnection &&other)
 {
    std::swap(fHandle, other.fHandle);
    std::swap(fCredentials, other.fCredentials);
+   std::swap(fMaxRetryAttempts, other.fMaxRetryAttempts);
+   std::swap(fRetryBaseDelayMs, other.fRetryBaseDelayMs);
    SetupErrorBuffer();
 }
 
@@ -678,6 +743,8 @@ ROOT::Internal::RCurlConnection &ROOT::Internal::RCurlConnection::RCurlConnectio
    fHandle = other.fHandle;
    other.fHandle = nullptr;
    fCredentials = std::move(other.fCredentials);
+   fMaxRetryAttempts = other.fMaxRetryAttempts;
+   fRetryBaseDelayMs = other.fRetryBaseDelayMs;
    SetupErrorBuffer();
    return *this;
 }
@@ -755,52 +822,98 @@ ROOT::RResult<void> ROOT::Internal::RCurlConnection::SetUrl(const std::string &u
 
 void ROOT::Internal::RCurlConnection::Perform(RStatus &status)
 {
-   auto rc = curl_easy_perform(fHandle);
+   const auto performRc = curl_easy_perform(fHandle);
+   status.fCurlCode = static_cast<int>(performRc);
 
 // CURLE_TOO_LARGE is available as of curl version 8.6.0
 #ifdef CURLE_TOO_LARGE
-   if (rc == CURLE_TOO_LARGE) {
+   if (performRc == CURLE_TOO_LARGE) {
 #else
-   if (rc == CURLE_OUT_OF_MEMORY) {
+   if (performRc == CURLE_OUT_OF_MEMORY) {
 #endif
       // The ranges don't even fit in the request header
       status.fStatusCode = RStatus::kTooManyRanges;
-   } else if (rc != CURLE_OK) {
+   } else if (performRc != CURLE_OK) {
       status.fStatusMsg = fErrorBuffer.get();
-      status.fStatusMsg += " [" + GetCurlErrorString(rc) + "]";
+      status.fStatusMsg += " [" + GetCurlErrorString(performRc) + "]";
 
       long osErrNo = 0;
-      rc = curl_easy_getinfo(fHandle, CURLINFO_OS_ERRNO, &osErrNo);
-      if (rc == CURLE_OK)
+      if (curl_easy_getinfo(fHandle, CURLINFO_OS_ERRNO, &osErrNo) == CURLE_OK)
          status.fStatusMsg += " (OS errno: " + std::to_string(osErrNo) + ")";
+
+      // Failures of the transfer itself rather than of the request: the peer went away, the connection
+      // timed out, the response was cut short. None of these say anything about the resource, so they are
+      // worth repeating. Anything else (a bad option, an unresolvable host, a TLS failure) would fail the
+      // same way again.
+      switch (performRc) {
+      case CURLE_OPERATION_TIMEDOUT:
+      case CURLE_COULDNT_CONNECT:
+      case CURLE_RECV_ERROR:
+      case CURLE_SEND_ERROR:
+      case CURLE_GOT_NOTHING:
+      case CURLE_PARTIAL_FILE: status.fStatusCode = RStatus::kTransportError; break;
+      default: status.fStatusCode = RStatus::kIOError; break;
+      }
    } else {
       long responseCode = 0;
-      rc = curl_easy_getinfo(fHandle, CURLINFO_RESPONSE_CODE, &responseCode);
-      R__ASSERT(rc == CURLE_OK);
+      auto rcInfo = curl_easy_getinfo(fHandle, CURLINFO_RESPONSE_CODE, &responseCode);
+      R__ASSERT(rcInfo == CURLE_OK);
+      status.fHttpCode = responseCode;
+
       if ((responseCode / 100 == kHttpResponseSuccessClass) || (responseCode == kHttpResponseRangeNotSatisfiable)) {
          // Requests past the size of the remote resource are considered valid. They simply receive zero bytes.
          status.fStatusCode = RStatus::kSuccess;
       } else if (responseCode == kHttpResponseNotFound) {
          status.fStatusCode = RStatus::kNotFound;
       } else if (responseCode == kHttpResponseBadRequest) {
+         // Some servers signal "too many ranges in the request" with a plain 400, which SendRangesReq
+         // reacts to by halving the number of ranges per request. There is no other way to detect that
+         // condition, so a 400 keeps this meaning even though it is not what the code literally says.
          status.fStatusCode = RStatus::kTooManyRanges;
       } else if (responseCode == kHttpResponseForbidden) {
          status.fStatusCode = RStatus::kForbidden;
+      } else if ((responseCode == kHttpResponseTooManyRequests) ||
+                 (responseCode / 100 == kHttpResponseServerErrorClass)) {
+         // Throttling and server-side failures pass by themselves often enough to be worth waiting out.
+         status.fStatusCode = RStatus::kTransientHTTP;
+         status.fRetryAfterSec = GetRetryAfterSeconds(fHandle);
       } else {
          status.fStatusCode = RStatus::kIOError;
       }
    }
 }
 
+void ROOT::Internal::RCurlConnection::WaitBeforeRetry(unsigned int attempt, const RStatus &status,
+                                                      const char *what) const
+{
+   const auto delayMs = ComputeBackoffMs(attempt, fRetryBaseDelayMs, status.fRetryAfterSec);
+   if (delayMs > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+
+   R__LOG_DEBUG(0, HTTPClientLog()) << "retrying " << what << " " << fEscapedUrl << " after " << status.fStatusMsg
+                                    << " (attempt " << (attempt + 1) << " of " << fMaxRetryAttempts << ")";
+}
+
 ROOT::Internal::RCurlConnection::RStatus ROOT::Internal::RCurlConnection::SendHeadReq(std::uint64_t &remoteSize)
 {
    remoteSize = kUnknownSize;
 
-   ResetHandle();
-   SetCurlOption(fHandle, CURLOPT_NOBODY, 1);
-
    RStatus status;
-   Perform(status);
+   for (unsigned int attempt = 0; attempt < fMaxRetryAttempts; ++attempt) {
+      if (attempt > 0)
+         WaitBeforeRetry(attempt, status, "HEAD");
+
+      // A HEAD request keeps no state across attempts, so it is enough to set the handle up again.
+      ResetHandle();
+      SetCurlOption(fHandle, CURLOPT_NOBODY, 1);
+
+      status = RStatus();
+      Perform(status);
+
+      if (!status.IsRetryable())
+         break;
+   }
+
    if (status) {
       curl_off_t length = -1;
       auto rc = curl_easy_getinfo(fHandle, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length);
@@ -834,67 +947,88 @@ ROOT::Internal::RCurlConnection::SendRangesReq(std::size_t N, RUserRange *ranges
       return RStatus(RStatus::kSuccess);
    }
 
-   ResetHandle();
-   SetCurlOption(fHandle, CURLOPT_HTTPGET, 1);
-
-   RTransferState transfer(ranges, order, fHandle);
-   SetCurlOption(fHandle, CURLOPT_WRITEFUNCTION, CallbackData);
-   SetCurlOption(fHandle, CURLOPT_WRITEDATA, &transfer);
-
-#ifndef HAS_CURL_EASY_HEADER
-   SetCurlOption(fHandle, CURLOPT_HEADERFUNCTION, CallbackHeader);
-   SetCurlOption(fHandle, CURLOPT_HEADERDATA, &transfer);
-#endif
-
    RStatus status;
+   std::string extraMsg;
    // There is no HTTP request to determine the maximum number of ranges that the web server can serve.
    // Therefore, we try with all the ranges (or fMaxNRangesPerReqest, if explicitly set), and half that number
    // as long as needed.
    // If we need to reduce the number of ranges per requests and no limit was set,
    // we will remember the working number for the next requests.
+   // The batch size deliberately lives outside the retry loop: once the server has shown that a number of
+   // ranges is too large, that is a property of the server rather than a passing condition.
    std::size_t batchSize = fMaxNRangesPerReqest ? fMaxNRangesPerReqest : requestRanges.size();
-   bool tryAgain;
-   do {
-      tryAgain = false;
-      // If we have multiple batches, we could in principle submit them concurrently using multiple connections
-      // (and CURL easy handles) that get pooled in a CURL multi handle.
-      // This is a potential future optimization.
-      for (std::size_t b = 0; b < requestRanges.size(); b += batchSize) {
-         const std::size_t nRanges = std::min(batchSize, requestRanges.size() - b);
-         std::string rangeHeader = requestRanges[b].ToString();
-         for (std::size_t i = 1; i < nRanges; ++i) {
-            rangeHeader += "," + requestRanges[b + i].ToString();
-         }
-         SetCurlOption(fHandle, CURLOPT_RANGE, rangeHeader.c_str());
 
-         if (b > 0) {
-            const std::uint64_t lastByteRequested = requestRanges[b - 1].fLastByte;
-            // Advance all ranges that are already out of scope
-            // Note that we have to start at zero because the previous multi-part request may have visited the
-            // ranges in arbirary order.
-            for (transfer.fCurrentRange = 0; transfer.fCurrentRange < N; transfer.fCurrentRange++) {
-               if (transfer.GetCurrentRange().fOffset > lastByteRequested)
-                  break;
-            }
-         }
-
-         transfer.fResponseCode = 0; // reset HTTP response code for the next request
-         Perform(status);
-         if ((status.fStatusCode == RStatus::kTooManyRanges) && (batchSize > 1)) {
-            batchSize /= 2;
-            tryAgain = true;
-            break;
-         }
-         if (!status)
-            break;
+   for (unsigned int attempt = 0; attempt < fMaxRetryAttempts; ++attempt) {
+      if (attempt > 0) {
+         WaitBeforeRetry(attempt, status, "range request for");
+         // The write callbacks accumulate into fNBytesRecv, so a retry has to start from zero. Together
+         // with the fresh RTransferState below this makes the attempt independent of the failed one; a
+         // retry that kept either would resume mid-response and write bytes at the wrong offsets.
+         for (std::size_t i = 0; i < N; ++i)
+            ranges[i].fNBytesRecv = 0;
       }
-   } while (tryAgain);
+
+      ResetHandle();
+      SetCurlOption(fHandle, CURLOPT_HTTPGET, 1);
+
+      RTransferState transfer(ranges, order, fHandle);
+      SetCurlOption(fHandle, CURLOPT_WRITEFUNCTION, CallbackData);
+      SetCurlOption(fHandle, CURLOPT_WRITEDATA, &transfer);
+
+#ifndef HAS_CURL_EASY_HEADER
+      SetCurlOption(fHandle, CURLOPT_HEADERFUNCTION, CallbackHeader);
+      SetCurlOption(fHandle, CURLOPT_HEADERDATA, &transfer);
+#endif
+
+      bool tryAgain;
+      do {
+         tryAgain = false;
+         // If we have multiple batches, we could in principle submit them concurrently using multiple connections
+         // (and CURL easy handles) that get pooled in a CURL multi handle.
+         // This is a potential future optimization.
+         for (std::size_t b = 0; b < requestRanges.size(); b += batchSize) {
+            const std::size_t nRanges = std::min(batchSize, requestRanges.size() - b);
+            std::string rangeHeader = requestRanges[b].ToString();
+            for (std::size_t i = 1; i < nRanges; ++i) {
+               rangeHeader += "," + requestRanges[b + i].ToString();
+            }
+            SetCurlOption(fHandle, CURLOPT_RANGE, rangeHeader.c_str());
+
+            if (b > 0) {
+               const std::uint64_t lastByteRequested = requestRanges[b - 1].fLastByte;
+               // Advance all ranges that are already out of scope
+               // Note that we have to start at zero because the previous multi-part request may have visited the
+               // ranges in arbirary order.
+               for (transfer.fCurrentRange = 0; transfer.fCurrentRange < N; transfer.fCurrentRange++) {
+                  if (transfer.GetCurrentRange().fOffset > lastByteRequested)
+                     break;
+               }
+            }
+
+            transfer.fResponseCode = 0; // reset HTTP response code for the next request
+            status = RStatus();
+            Perform(status);
+            if ((status.fStatusCode == RStatus::kTooManyRanges) && (batchSize > 1)) {
+               batchSize /= 2;
+               tryAgain = true;
+               break;
+            }
+            if (!status)
+               break;
+         }
+      } while (tryAgain);
+
+      extraMsg = transfer.fExtraMsg;
+
+      if (!status.IsRetryable())
+         break;
+   }
 
    if (status && (fMaxNRangesPerReqest == 0) && (batchSize < requestRanges.size()))
       fMaxNRangesPerReqest = batchSize;
 
-   if (!transfer.fExtraMsg.empty()) {
-      status.fStatusMsg += "; extra information: " + transfer.fExtraMsg;
+   if (!extraMsg.empty()) {
+      status.fStatusMsg += "; extra information: " + extraMsg;
    }
 
    ReverseDisplacements(displacements, ranges, order, static_cast<bool>(status));
@@ -905,19 +1039,31 @@ ROOT::Internal::RCurlConnection::SendRangesReq(std::size_t N, RUserRange *ranges
 ROOT::Internal::RCurlConnection::RStatus
 ROOT::Internal::RCurlConnection::SendPutReq(const unsigned char *data, std::size_t length)
 {
-   ResetHandle();
-
-   SetCurlOption(fHandle, CURLOPT_UPLOAD, 1L);
-   SetCurlOption(fHandle, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(length));
-
-   RUploadState uploadState{data, length, 0};
-   SetCurlOption(fHandle, CURLOPT_READFUNCTION, CallbackPutRead);
-   SetCurlOption(fHandle, CURLOPT_READDATA, &uploadState);
-   SetCurlOption(fHandle, CURLOPT_SEEKFUNCTION, CallbackPutSeek);
-   SetCurlOption(fHandle, CURLOPT_SEEKDATA, &uploadState);
-
    RStatus status;
-   Perform(status);
+   for (unsigned int attempt = 0; attempt < fMaxRetryAttempts; ++attempt) {
+      if (attempt > 0)
+         WaitBeforeRetry(attempt, status, "PUT");
+
+      ResetHandle();
+
+      SetCurlOption(fHandle, CURLOPT_UPLOAD, 1L);
+      SetCurlOption(fHandle, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(length));
+
+      // A fresh upload state per attempt, so a retry starts from the beginning of the buffer no matter
+      // how far the failed attempt got. Retrying is safe because a PUT writes a whole object to a fixed
+      // URL: re-sending it stores the same bytes under the same key.
+      RUploadState uploadState{data, length, 0};
+      SetCurlOption(fHandle, CURLOPT_READFUNCTION, CallbackPutRead);
+      SetCurlOption(fHandle, CURLOPT_READDATA, &uploadState);
+      SetCurlOption(fHandle, CURLOPT_SEEKFUNCTION, CallbackPutSeek);
+      SetCurlOption(fHandle, CURLOPT_SEEKDATA, &uploadState);
+
+      status = RStatus();
+      Perform(status);
+
+      if (!status.IsRetryable())
+         break;
+   }
 
    return status;
 }

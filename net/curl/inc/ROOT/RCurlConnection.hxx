@@ -14,6 +14,7 @@
 
 #include <ROOT/RError.hxx>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -51,16 +52,31 @@ public:
          kNotFound,
          kForbidden,
          kIOError,
+         /// The server reported a condition that may pass by itself: HTTP 429 or 5xx. Retried automatically.
+         kTransientHTTP,
+         /// The request did not complete at the network level (timeout, reset connection, ...). Retried
+         /// automatically. Kept apart from kTransientHTTP so that "the server is busy" and "the network is
+         /// down" can be told apart without parsing fStatusMsg.
+         kTransportError,
          kUnknown
       };
 
       EStatusCode fStatusCode = kUnknown;
       std::string fStatusMsg;
+      /// HTTP response code, or 0 if the request failed before one was received
+      long fHttpCode = 0;
+      /// CURLcode of the transfer, 0 (CURLE_OK) if curl itself succeeded. An int rather than a CURLcode
+      /// because libcurl is linked PRIVATE, so dependents get no curl/curl.h -- as with fHandle below.
+      int fCurlCode = 0;
+      /// Value of the Retry-After response header in seconds, or -1 if it was absent or unparseable
+      long fRetryAfterSec = -1;
 
       RStatus() = default;
       explicit RStatus(EStatusCode code) : fStatusCode(code) {}
 
       explicit operator bool() const { return fStatusCode == kSuccess; }
+      /// True for failures that are worth repeating; a permanent error such as 403 or 404 is not.
+      bool IsRetryable() const { return fStatusCode == kTransientHTTP || fStatusCode == kTransportError; }
    };
 
 private:
@@ -72,11 +88,19 @@ private:
    std::size_t fMaxNRangesPerReqest = 0;
    std::string fEscapedUrl;              ///< The URL provided in the constructor escaped according to standard rules
    std::unique_ptr<char[]> fErrorBuffer; ///< For use by libcurl
+   /// Total number of attempts for a request, including the first one. Set to 1 to disable retrying.
+   unsigned int fMaxRetryAttempts = 3;
+   /// Delay before the first retry; subsequent retries back off exponentially from it. Zero retries
+   /// immediately, which is what the tests use.
+   unsigned int fRetryBaseDelayMs = 100;
 
    void SetupErrorBuffer();
    void SetOptions();
    void ResetHandle();
    void Perform(RStatus &status);
+   /// Sleep before attempt number `attempt` (one-based, so never called with 0) of a request to `what`,
+   /// backing off exponentially with jitter unless the server asked for a specific delay.
+   void WaitBeforeRetry(unsigned int attempt, const RStatus &status, const char *what) const;
 
 public:
    /// Returned by SendHeadReq() if the HTTP response contains no content-length header
@@ -127,6 +151,14 @@ public:
 
    void SetMaxNRangesPerRequest(std::size_t val) { fMaxNRangesPerReqest = val; }
    std::size_t GetMaxNRangesPerRequest() const { return fMaxNRangesPerReqest; }
+
+   /// Total attempts per request, including the first. One disables retrying.
+   void SetMaxRetryAttempts(unsigned int val) { fMaxRetryAttempts = std::max(1u, val); }
+   unsigned int GetMaxRetryAttempts() const { return fMaxRetryAttempts; }
+
+   /// Delay before the first retry, in milliseconds. Zero makes retries immediate.
+   void SetRetryBaseDelayMs(unsigned int val) { fRetryBaseDelayMs = val; }
+   unsigned int GetRetryBaseDelayMs() const { return fRetryBaseDelayMs; }
 };
 
 } // namespace Internal
